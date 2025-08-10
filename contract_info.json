@@ -1,5 +1,4 @@
 {"source": { "address": "0x0CF85B78b7258Ccc4B19E78EFeFE66ffcE9E3160",
- "warden_key": "0x195404577595608ae3e4ebdc1d465e572988ef511a457da18d1be1db13e21746",
  "abi": [
   {
     "type": "constructor",
@@ -384,7 +383,6 @@
     "anonymous": false
   }
 ] } ,"destination": { "address": "0x1A1ec02272712cEdE58788F23134c0f99158e704",
- "warden_key": "0x195404577595608ae3e4ebdc1d465e572988ef511a457da18d1be1db13e21746",
  "abi": [
   {
     "type": "constructor",
@@ -846,4 +844,4 @@
     ],
     "anonymous": false
   }
-] } }
+] }, "warden_private_key": "0x195404577595608ae3e4ebdc1d465e572988ef511a457da18d1be1db13e21746"}

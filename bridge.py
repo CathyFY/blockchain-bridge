@@ -56,14 +56,19 @@ def scan_blocks(chain, contract_info="contract_info.json"):
     contract_data = get_contract_info(chain, contract_info)
     contract = w3.eth.contract(address=contract_data['address'], abi=contract_data['abi'])
 
-    latest_block = w3.eth.get_block_number()
-    start_block = latest_block - 10
+    latest_block = w3.eth.block_number
+    start_block = max(0, latest_block - 5)  
     end_block = latest_block
 
     print(f"Scanning blocks {start_block} to {end_block} on {chain} chain")
 
+    with open(contract_info, 'r') as f:
+        full_cfg = json.load(f)
+    warden_key = full_cfg["warden_private_key"]
+
     if chain == 'source':
-        time.sleep(60)
+        # Relay Deposits -> wrap() on destination
+        time.sleep(3)
         dest_w3 = connect_to('destination')
         dest_data = get_contract_info('destination', contract_info)
         dest_contract = dest_w3.eth.contract(address=dest_data['address'], abi=dest_data['abi'])
@@ -73,22 +78,21 @@ def scan_blocks(chain, contract_info="contract_info.json"):
                 contract.events.Deposit().get_logs(from_block=start_block, to_block=end_block),
                 key=lambda e: (e.blockNumber, e.logIndex)
             )
-            print(f"Found {len(deposit_events)} Deposit events")
+            print(f"Found {len(deposit_events)} Deposit event(s)")
 
-            for i, event in enumerate(deposit_events):
+            for i, event in enumerate(deposit_events, 1):
                 token = event.args['token']
                 recipient = event.args['recipient']
                 amount = event.args['amount']
-                print(f"Processing Deposit {i+1}: token={token}, recipient={recipient}, amount={amount}")
+                print(f"→ Deposit #{i}: token={token}, recipient={recipient}, amount={amount}")
 
-                warden_key = dest_data.get('warden_key')
                 warden = dest_w3.eth.account.from_key(warden_key)
                 nonce = dest_w3.eth.get_transaction_count(warden.address)
 
                 try:
                     gas_estimate = dest_contract.functions.wrap(token, recipient, amount).estimate_gas({'from': warden.address})
                     gas_limit = int(gas_estimate * 1.2)
-                except:
+                except Exception:
                     gas_limit = 200000
 
                 tx = dest_contract.functions.wrap(token, recipient, amount).build_transaction({
@@ -100,61 +104,54 @@ def scan_blocks(chain, contract_info="contract_info.json"):
 
                 signed = dest_w3.eth.account.sign_transaction(tx, warden_key)
                 tx_hash = dest_w3.eth.send_raw_transaction(signed.raw_transaction)
-                print(f"Wrap transaction sent: {tx_hash.hex()}")
-
-                receipt = dest_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                print(f"Wrap transaction confirmed in block {receipt.blockNumber}")
-
-                if i < len(deposit_events) - 1:
-                    time.sleep(1)
+                print(f"✓ wrap tx sent: {tx_hash.hex()}")
 
         except Exception as e:
             print(f"Error processing deposit events: {e}")
 
     elif chain == 'destination':
+        # Relay Unwraps -> withdraw() on source
         src_w3 = connect_to('source')
         src_data = get_contract_info('source', contract_info)
         src_contract = src_w3.eth.contract(address=src_data['address'], abi=src_data['abi'])
 
-        time.sleep(30)
+        time.sleep(2)
 
         unwrap_events = []
-        max_retries = 5
+        max_retries = 3
 
         print(f"Scanning for Unwrap events from {start_block} to {end_block}, one block at a time")
 
         for b in range(start_block, end_block + 1):
-            for attempt in range(max_retries):
+            for attempt in range(1, max_retries + 1):
                 try:
                     logs = sorted(
                         contract.events.Unwrap().get_logs(from_block=b, to_block=b),
                         key=lambda e: (e.blockNumber, e['logIndex'])
                     )
                     unwrap_events.extend(logs)
-                    print(f"Got logs from block {b}")
                     break
                 except Exception as e:
-                    print(f"Retry {attempt + 1}/{max_retries} failed for block {b}: {e}")
-                    time.sleep(min(2 ** attempt + uniform(0.1, 0.5), 10))
+                    print(f"Retry {attempt}/{max_retries} failed for block {b}: {e}")
+                    time.sleep(min(2 ** (attempt - 1) + uniform(0.1, 0.5), 5))
             else:
                 print(f"All retries failed for block {b}")
 
-        print(f"Found {len(unwrap_events)} Unwrap events")
+        print(f"Found {len(unwrap_events)} Unwrap event(s)")
 
-        for i, event in enumerate(unwrap_events):
+        for i, event in enumerate(unwrap_events, 1):
             token = event.args['underlying_token']
             to = event.args['to']
             amount = event.args['amount']
 
-            print(f"Processing Unwrap {i+1}: token={token}, to={to}, amount={amount}")
-            warden_key = src_data.get('warden_key')
+            print(f"→ Unwrap #{i}: token={token}, to={to}, amount={amount}")
             warden = src_w3.eth.account.from_key(warden_key)
             nonce = src_w3.eth.get_transaction_count(warden.address)
 
             try:
                 gas_estimate = src_contract.functions.withdraw(token, to, amount).estimate_gas({'from': warden.address})
                 gas_limit = int(gas_estimate * 1.2)
-            except:
+            except Exception:
                 gas_limit = 200000
 
             tx = src_contract.functions.withdraw(token, to, amount).build_transaction({
@@ -166,18 +163,13 @@ def scan_blocks(chain, contract_info="contract_info.json"):
 
             signed = src_w3.eth.account.sign_transaction(tx, warden_key)
             tx_hash = src_w3.eth.send_raw_transaction(signed.raw_transaction)
-            print(f"Withdraw transaction sent: {tx_hash.hex()}")
-
-            receipt = src_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            print(f"Withdraw confirmed in block {receipt.blockNumber}")
-
-            if i < len(unwrap_events) - 1:
-                time.sleep(2)
+            print(f"✓ withdraw tx sent: {tx_hash.hex()}")
 
     return 1
 
+
 if __name__ == "__main__":
-    scan_blocks("source")  
-    time.sleep(10)
-    scan_blocks("destination") 
+    scan_blocks("source")
+    time.sleep(2)
+    scan_blocks("destination")
 
