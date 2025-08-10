@@ -53,131 +53,142 @@ def scan_blocks(chain, contract_info="contract_info.json"):
     
         #YOUR CODE HERE
     w3 = connect_to(chain)
-    contract_data = get_contract_info(chain, contract_info)
-    contract = w3.eth.contract(address=contract_data['address'], abi=contract_data['abi'])
+    meta = get_contract_info(chain, contract_info)
+    contract = w3.eth.contract(address=meta["address"], abi=meta["abi"])
 
-    latest_block = w3.eth.get_block_number()
-    start_block = latest_block - 10
-    end_block = latest_block
+    head = w3.eth.get_block_number()
+    start_block = max(head - 10, 0)
+    end_block = head
+    print(f"Scanning blocks {start_block} → {end_block} on {chain}")
 
-    print(f"Scanning blocks {start_block} to {end_block} on {chain} chain")
+    # Load warden key once
+    try:
+        with open(contract_info, "r") as _fh:
+            _cfg = json.load(_fh)
+        warden_key = _cfg.get("warden_private_key")
+    except Exception as _ex:
+        print(f"Failed to read warden key: {_ex}")
+        return 0
+    if not warden_key:
+        print("warden_private_key missing in contract_info; aborting.")
+        return 0
 
-
-    with open(contract_info, 'r') as f:
-        full_cfg = json.load(f)
-    warden_key = full_cfg.get('warden_private_key')
-
-    if chain == 'source':
-        time.sleep(60)
-        dest_w3 = connect_to('destination')
-        dest_data = get_contract_info('destination', contract_info)
-        dest_contract = dest_w3.eth.contract(address=dest_data['address'], abi=dest_data['abi'])
+    if chain == "source":
+        time.sleep(60)  
+        dst_w3 = connect_to("destination")
+        dst_meta = get_contract_info("destination", contract_info)
+        dst_contract = dst_w3.eth.contract(address=dst_meta["address"], abi=dst_meta["abi"])
 
         try:
-            deposit_events = sorted(
-                contract.events.Deposit().get_logs(from_block=start_block, to_block=end_block),
-                key=lambda e: (e.blockNumber, e.logIndex)
+            deposit_events = contract.events.Deposit().get_logs(
+                from_block=start_block, to_block=end_block
             )
-            print(f"Found {len(deposit_events)} Deposit events")
-
-            for i, event in enumerate(deposit_events):
-                token = event.args['token']
-                recipient = event.args['recipient']
-                amount = event.args['amount']
-                print(f"Processing Deposit {i+1}: token={token}, recipient={recipient}, amount={amount}")
-
-
-                warden = dest_w3.eth.account.from_key(warden_key)
-                nonce = dest_w3.eth.get_transaction_count(warden.address)
-
+            try:
+                deposit_events.sort(key=lambda ev: (ev.blockNumber, ev.logIndex))
+            except Exception:
                 try:
-                    gas_estimate = dest_contract.functions.wrap(token, recipient, amount).estimate_gas({'from': warden.address})
-                    gas_limit = int(gas_estimate * 1.2)
-                except:
-                    gas_limit = 200000
+                    deposit_events.sort(key=lambda ev: (ev["blockNumber"], ev["logIndex"]))
+                except Exception:
+                    pass
+            print(f"Found {len(deposit_events)} Deposit event(s)")
+        except Exception as ex:
+            print(f"Error fetching Deposit logs: {ex}")
+            deposit_events = []
 
-                tx = dest_contract.functions.wrap(token, recipient, amount).build_transaction({
-                    'from': warden.address,
-                    'nonce': nonce,
-                    'gas': gas_limit,
-                    'gasPrice': dest_w3.eth.gas_price
-                })
+        for i, ev in enumerate(deposit_events, 1):
+            token = ev.args["token"]
+            recipient = ev.args["recipient"]
+            amount = ev.args["amount"]
+            print(f"Deposit #{i}: token={token} recipient={recipient} amount={amount}")
 
-                signed = dest_w3.eth.account.sign_transaction(tx, warden_key)
-                tx_hash = dest_w3.eth.send_raw_transaction(signed.raw_transaction)
-                print(f"Wrap transaction sent: {tx_hash.hex()}")
+            acct = dst_w3.eth.account.from_key(warden_key)
+            nonce = dst_w3.eth.get_transaction_count(acct.address)
+            fn = dst_contract.functions.wrap(token, recipient, amount)
 
-                receipt = dest_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                print(f"Wrap transaction confirmed in block {receipt.blockNumber}")
+            try:
+                gas_est = fn.estimate_gas({"from": acct.address})
+                gas_limit = int(gas_est * 1.2)
+            except Exception:
+                gas_limit = 200000
 
-                if i < len(deposit_events) - 1:
-                    time.sleep(1)
+            tx = fn.build_transaction({
+                "from": acct.address,
+                "nonce": nonce,
+                "gas": gas_limit,
+                "gasPrice": dst_w3.eth.gas_price,
+            })
+            signed = dst_w3.eth.account.sign_transaction(tx, warden_key)
+            tx_hash = dst_w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"Wrap sent: {tx_hash.hex()}")
+            rcpt = dst_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            print(f"Wrap confirmed in block {rcpt.blockNumber}")
 
-        except Exception as e:
-            print(f"Error processing deposit events: {e}")
+            if i != len(deposit_events):
+                time.sleep(1)
 
-    elif chain == 'destination':
-        src_w3 = connect_to('source')
-        src_data = get_contract_info('source', contract_info)
-        src_contract = src_w3.eth.contract(address=src_data['address'], abi=src_data['abi'])
+    elif chain == "destination":
+        src_w3 = connect_to("source")
+        src_meta = get_contract_info("source", contract_info)
+        src_contract = src_w3.eth.contract(address=src_meta["address"], abi=src_meta["abi"])
 
         time.sleep(30)
 
         unwrap_events = []
-        max_retries = 5
-
-        print(f"Scanning for Unwrap events from {start_block} to {end_block}, one block at a time")
-
+        retries = 5
+        print(f"Per-block scan for Unwrap events: {start_block}..{end_block}")
         for b in range(start_block, end_block + 1):
-            for attempt in range(max_retries):
+            fetched = False
+            for attempt in range(1, retries + 1):
                 try:
-                    logs = sorted(
-                        contract.events.Unwrap().get_logs(from_block=b, to_block=b),
-                        key=lambda e: (e.blockNumber, e['logIndex'])
-                    )
+                    logs = contract.events.Unwrap().get_logs(from_block=b, to_block=b)
+                    try:
+                        logs.sort(key=lambda ev: (ev.blockNumber, ev["logIndex"]))
+                    except Exception:
+                        try:
+                            logs.sort(key=lambda ev: (ev.blockNumber, ev.logIndex))
+                        except Exception:
+                            pass
                     unwrap_events.extend(logs)
-                    print(f"Got logs from block {b}")
+                    print(f"Got Unwrap logs from block {b}")
+                    fetched = True
                     break
-                except Exception as e:
-                    print(f"Retry {attempt + 1}/{max_retries} failed for block {b}: {e}")
-                    time.sleep(min(2 ** attempt + uniform(0.1, 0.5), 10))
-            else:
-                print(f"All retries failed for block {b}")
+                except Exception as ex:
+                    backoff = min(2 ** (attempt - 1), 10)
+                    print(f"Retry {attempt}/{retries} for block {b}: {ex}; sleeping {backoff}s")
+                    time.sleep(backoff)
+            if not fetched:
+                print(f"Failed to fetch logs for block {b}")
 
-        print(f"Found {len(unwrap_events)} Unwrap events")
+        print(f"Found {len(unwrap_events)} Unwrap event(s)")
+        for i, ev in enumerate(unwrap_events, 1):
+            token = ev.args["underlying_token"]
+            to_addr = ev.args["to"]
+            amount = ev.args["amount"]
+            print(f"Unwrap #{i}: token={token} to={to_addr} amount={amount}")
 
-        for i, event in enumerate(unwrap_events):
-            token = event.args['underlying_token']
-            to = event.args['to']
-            amount = event.args['amount']
-
-            print(f"Processing Unwrap {i+1}: token={token}, to={to}, amount={amount}")
-
-
-            warden = src_w3.eth.account.from_key(warden_key)
-            nonce = src_w3.eth.get_transaction_count(warden.address)
+            acct = src_w3.eth.account.from_key(warden_key)
+            nonce = src_w3.eth.get_transaction_count(acct.address)
+            fn = src_contract.functions.withdraw(token, to_addr, amount)
 
             try:
-                gas_estimate = src_contract.functions.withdraw(token, to, amount).estimate_gas({'from': warden.address})
-                gas_limit = int(gas_estimate * 1.2)
-            except:
+                gas_est = fn.estimate_gas({"from": acct.address})
+                gas_limit = int(gas_est * 1.2)
+            except Exception:
                 gas_limit = 200000
 
-            tx = src_contract.functions.withdraw(token, to, amount).build_transaction({
-                'from': warden.address,
-                'nonce': nonce,
-                'gas': gas_limit,
-                'gasPrice': src_w3.eth.gas_price
+            tx = fn.build_transaction({
+                "from": acct.address,
+                "nonce": nonce,
+                "gas": gas_limit,
+                "gasPrice": src_w3.eth.gas_price,
             })
-
             signed = src_w3.eth.account.sign_transaction(tx, warden_key)
             tx_hash = src_w3.eth.send_raw_transaction(signed.raw_transaction)
-            print(f"Withdraw transaction sent: {tx_hash.hex()}")
+            print(f"Withdraw sent: {tx_hash.hex()}")
+            rcpt = src_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            print(f"Withdraw confirmed in block {rcpt.blockNumber}")
 
-            receipt = src_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            print(f"Withdraw confirmed in block {receipt.blockNumber}")
-
-            if i < len(unwrap_events) - 1:
+            if i != len(unwrap_events):
                 time.sleep(2)
 
     return 1
