@@ -65,7 +65,7 @@ def scan_blocks(chain, contract_info="contract_info.json"):
 
     with open(contract_info, 'r') as f:
         full_cfg = json.load(f)
-    warden_key = full_cfg.get('warden_key')
+    warden_key = full_cfg.get('warden_private_key')
 
     if chain == 'source':
         time.sleep(60)
